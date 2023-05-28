@@ -1,16 +1,12 @@
 package main
 
 import (
-	"context"
 	"database/sql"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
-	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -71,7 +67,7 @@ func readConfig(filename string) (Config, error) {
 // checkQuery connects to the database, runs a query, and sends the results to Prometheus.
 // It uses the provided context to support cancellation.
 
-func checkQuery(ctx context.Context, user string, password string, host string, port int, database string, query string, name string, interval time.Duration) {
+func checkQuery(user string, password string, host string, port int, database string, query string, name string, interval time.Duration) {
 	// Log that the function is attempting to connect to the database
 	log.Printf("[%s] Attemping connection", database)
 
@@ -112,14 +108,7 @@ func checkQuery(ctx context.Context, user string, password string, host string, 
 	// Send the query result to Prometheus
 	queryMetric.WithLabelValues(name, query).Set(float64(count))
 
-	// Wait for either the context to be cancelled or for the interval to pass
-	select {
-	case <-time.After(interval * time.Second):
-		// Sleep duration elapsed
-	case <-ctx.Done():
-		// Context cancelled
-		return
-	}
+	time.Sleep(interval * time.Second)
 }
 
 func main() {
@@ -138,77 +127,25 @@ func main() {
 		log.Fatalf("Error reading hosts yaml file: %v", err)
 	}
 
-	// Create a cancellable context
-	ctx, cancel := context.WithCancel(context.Background())
-
-	// Capture SIGINT and SIGTERM signals to stop goroutines cleanly
-
-	// Create a channel to receive OS signals
-	signalCh := make(chan os.Signal, 1)
-
-	// Configure the program to send an interrupt signal (SIGINT) or termination signal (SIGTERM) to the signalCh channel
-	signal.Notify(signalCh, os.Interrupt, syscall.SIGTERM)
-
-	// Start a goroutine that waits for a signal and then cancels the context
-	go func() {
-		sig := <-signalCh
-		fmt.Printf("Received signal: %s. Exiting...\n", sig)
-		cancel() // This will cancel the context
-		fmt.Println("Cancel function called.")
-	}()
-
 	// For each query configuration, start a goroutine that periodically runs the query
 	for _, conf := range config.Queries {
 		go func(conf Query) {
-			ticker := time.NewTicker(conf.Interval)
-			defer ticker.Stop()
 			for {
-				select {
-				case <-ctx.Done():
-					fmt.Println("Received done signal. Exiting goroutine...")
-					// Clean up and stop go routine
-					return
-				case <-ticker.C:
-					checkQuery(ctx, config.DB_User, config.DB_Password, config.DB_Host, config.DB_Port, conf.Databse, conf.Query, conf.Name, conf.Interval)
-				}
+				checkQuery(config.DB_User, config.DB_Password, config.DB_Host, config.DB_Port, conf.Databse, conf.Query, conf.Name, conf.Interval)
 			}
 		}(conf)
 	}
 
-	// Create an instance of the http.Server struct. This allows for more control
-	// over the HTTP server configuration and lifecycle than using http.ListenAndServe directly.
+	// Remove the goroutine that runs the server
+	// Instead, create the server and call ListenAndServe directly in the main function
 	srv := &http.Server{
-		// Addr field is the TCP address for the server to listen on. Here it's set to the port specified in the config.
-		Addr: fmt.Sprintf(":%d", config.Exporter_Port),
-		// Handler field is the http.Handler to invoke. promhttp.Handler() returns an HTTP handler
-		// that exposes the default Prometheus registry as an HTTP endpoint.
+		Addr:    fmt.Sprintf(":%d", config.Exporter_Port),
 		Handler: promhttp.Handler(),
 	}
-
-	// Start the server in a separate goroutine so that it doesn't block the main function.
-	// This allows the main function to continue and listen for the context cancellation.
-	go func() {
-		// Log the start of the server.
-		log.Printf("Starting Server on port %d ", config.Exporter_Port)
-
-		// Call ListenAndServe on the server. This will block until the server is stopped.
-		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
-			// If the server is closed normally, ListenAndServe returns http.ErrServerClosed.
-			// If it returns any other error, log this as a fatal error.
-			log.Fatalf("ListenAndServe(): %v", err)
-		}
-	}()
-
-	// Block and wait for the context to be cancelled. This could be due to receiving a shutdown signal
-	// (like SIGINT or SIGTERM) or due to a call to cancel function somewhere else in your program.
-	<-ctx.Done()
-
-	// Once the context is cancelled, log a shutdown message and attempt to gracefully shutdown the server.
-	// This involves finishing all current requests and then closing the server.
-	log.Println("Shutting down the server...")
-	if err := srv.Shutdown(context.Background()); err != nil {
-		// If the server cannot be shutdown cleanly, log the error.
-		log.Printf("Could not shutdown server: %v", err)
+	log.Printf("Starting Server on port %d ", config.Exporter_Port)
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		// Unexpected error
+		log.Fatalf("ListenAndServe(): %v", err)
 	}
 
 }
